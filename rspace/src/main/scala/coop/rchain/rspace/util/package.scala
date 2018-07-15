@@ -1,46 +1,82 @@
 package coop.rchain.rspace
 
+import coop.rchain.rspace.internal.GNAT
+import scodec.bits.ByteVector
+
 import scala.collection.immutable.Seq
 
 package object util {
 
   /**
-    * Runs a computation for its side-effects, discarding its value
-    *
-    * @param a A computation to run
+    * Extracts a continuation from a produce result
     */
-  def ignore[A](a: => A): Unit = {
-    val _: A = a
-    ()
-  }
+  def getK[A, K](t: Option[(K, A)]): K =
+    t.map(_._1).get
+
+  /** Runs a continuation with the accompanying data
+    */
+  def runK[T](t: Option[((T) => Unit, T)]): Unit =
+    t.foreach { case (k, data) => k(data) }
+
+  /** Runs a list of continuations with the accompanying data
+    */
+  def runKs[T](t: Seq[Option[((T) => Unit, T)]]): Unit =
+    t.foreach { case Some((k, data)) => k(data); case None => () }
 
   /**
-    * Executes a function `f` with a given [[AutoCloseable]] `a` as its argument,
-    * returning the result of the function and closing the `a`
+    * Compare to `memcmp` in C/C++
     *
-    * Compare to Java's "try-with-resources"
-    *
-    * @param a A given resource implementing [[AutoCloseable]]
-    * @param f A function that takes this resource as its argument
+    * Based on:
+    * [[https://github.com/OpenTSDB/asynchbase/blob/f6a8ccb7e55ed9bc0aad265345da4c679e750055/src/Bytes.java#L549-L572]]
     */
-  def withResource[A <: AutoCloseable, B](a: A)(f: A => B): B =
-    try {
-      f(a)
-    } finally {
-      a.close()
+  def memcmp(a: Array[Byte], b: Array[Byte]): Int = {
+    val c = a.length - b.length
+    if (c != 0) {
+      c
+    } else {
+      for (i <- 0 until a.length) {
+        val ai = a(i)
+        val bi = b(i)
+        if (ai != bi) {
+          return (ai & 0xFF) - (bi & 0xFF)
+        }
+      }
+      0
     }
-
-  /** Drops the 'i'th element of a list.
-    */
-  def dropIndex[T](xs: Seq[T], n: Int): Seq[T] = {
-    val (l1, l2) = xs splitAt n
-    l1 ++ (l2 drop 1)
   }
 
-  /** Removes the first occurrence of an element that matches the given predicate.
-    */
-  def removeFirst[T](xs: List[T])(p: T => Boolean): List[T] = {
-    val (l1, l2) = xs.span(x => !p(x))
-    l1 ::: l2.drop(1)
+  def canonicalize[C, P, A, K](gnat: GNAT[C, P, A, K]): GNAT[C, P, A, K] =
+    gnat.copy(
+      wks = gnat.wks.sortBy(_.source.hash.bytes)(ordByteVector),
+      data = gnat.data.sortBy(_.source.hash.bytes)(ordByteVector)
+    )
+
+  def veccmp(a: ByteVector, b: ByteVector): Int = {
+    val c = a.length - b.length
+    if (c != 0) {
+      c.toInt
+    } else {
+      for (i <- 0L until a.length) {
+        //indexed access of two ByteVectors can be not fast enough,
+        //however it is used by ByteVector creators (see === implementation)
+        val ai = a(i)
+        val bi = b(i)
+        if (ai != bi) {
+          return (ai & 0xFF) - (bi & 0xFF)
+        }
+      }
+      0
+    }
   }
+
+  val ordArrayByte: Ordering[Array[Byte]] = (x: Array[Byte], y: Array[Byte]) => memcmp(x, y)
+
+  val ordByteVector: Ordering[ByteVector] = (a: ByteVector, b: ByteVector) => veccmp(a, b)
+
+  val ordByteVectorPair: Ordering[(ByteVector, ByteVector)] =
+    (a: (ByteVector, ByteVector), b: (ByteVector, ByteVector)) =>
+      veccmp(a._1, b._1) match {
+        case 0 => veccmp(a._2, b._2)
+        case c => c
+    }
 }

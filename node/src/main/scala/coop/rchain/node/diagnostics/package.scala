@@ -13,7 +13,7 @@ import coop.rchain.metrics.Metrics
 import coop.rchain.node.model.diagnostics._
 import coop.rchain.catscontrib._
 import Catscontrib._
-import coop.rchain.p2p.effects.NodeDiscovery
+import coop.rchain.comm.discovery._
 import com.google.protobuf.ByteString
 import com.google.protobuf.empty.Empty
 import javax.management.ObjectName
@@ -160,23 +160,42 @@ package object diagnostics {
         }
     }
 
-  def storeMetrics[F[_]: Capture](store: IStore[_, _, _, _], data_dir: Path): StoreMetrics[F] =
+  def storeMetrics[F[_]: Capture](store: IStore[_, _, _, _],
+                                  replayStore: IStore[_, _, _, _],
+                                  data_dir: Path): StoreMetrics[F] = {
+    def convert(c: coop.rchain.rspace.StoreCount): Option[RSpaceUsageMetric] =
+      Some(RSpaceUsageMetric(c.count, c.avgMilliseconds, c.peakRate, c.currentRate))
+
     new StoreMetrics[F] {
       def storeUsage: F[StoreUsage] =
         Capture[F].capture {
-          val storeCounters = store.getStoreCounters
-          val totalSize     = data_dir.folderSize
+          val storeCounters       = store.getStoreCounters
+          val replayStoreCounters = replayStore.getStoreCounters
+          val totalSize           = data_dir.folderSize
           StoreUsage(
             totalSizeOnDisk = totalSize,
-            rspaceSizeOnDisk = storeCounters.sizeOnDisk,
-            rspaceDataEntries = storeCounters.dataEntries,
-            rspaceConsumesCount = storeCounters.consumesCount,
-            rspaceConsumeAvgMilliseconds = storeCounters.consumeAvgMilliseconds,
-            rspaceProducesCount = storeCounters.producesCount,
-            rspaceProduceAvgMilliseconds = storeCounters.produceAvgMilliseconds
+            rspaceSizeOnDisk = storeCounters.sizeOnDisk, // + replayStoreCounters.sizeOnDisk,
+            rspaceDataEntries = storeCounters.dataEntries, // + replayStoreCounters.dataEntries,
+            rspace = Some(
+              RSpaceUsage(
+                consumes = convert(storeCounters.consumesCount),
+                produces = convert(storeCounters.producesCount),
+                consumesComm = convert(storeCounters.consumesCommCount),
+                producesComm = convert(storeCounters.producesCommCount),
+                installComm = convert(storeCounters.installCommCount)
+              )),
+            replayRSpace = Some(
+              RSpaceUsage(
+                consumes = convert(replayStoreCounters.consumesCount),
+                produces = convert(replayStoreCounters.producesCount),
+                consumesComm = convert(replayStoreCounters.consumesCommCount),
+                producesComm = convert(replayStoreCounters.producesCommCount),
+              )
+            )
           )
         }
     }
+  }
 
   def metrics[F[_]: Capture]: Metrics[F] =
     new Metrics[F] {

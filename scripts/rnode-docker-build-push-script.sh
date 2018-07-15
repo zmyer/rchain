@@ -66,8 +66,6 @@ apt-get install openjdk-8-jdk -yqq
 ## Build Needed Crypto
 # Build secp 
 apt-get install autoconf libtool -yqq
-cd ${PROJECT_ROOT_DIR}
-./scripts/install_secp.sh
 
 # Build libsodium
 cd ${PROJECT_ROOT_DIR}
@@ -95,7 +93,7 @@ apt-get install jflex -yqq
 
 ## Build RChain via SBT build.sbt 
 cd ${PROJECT_ROOT_DIR}
-sbt bnfc:generate node/docker
+sbt bnfc:generate node/docker:publishLocal
 
 ## Tag and push newly built docker image(s).
 # Setup auth, source image(s) and target/destination image(s) name in variables 

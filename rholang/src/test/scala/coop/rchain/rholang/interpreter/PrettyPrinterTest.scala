@@ -3,7 +3,7 @@ package coop.rchain.rholang.interpreter
 import coop.rchain.models.Channel.ChannelInstance._
 import coop.rchain.models.Expr.ExprInstance._
 import coop.rchain.models.{Send, _}
-import coop.rchain.rholang.interpreter.implicits.{GPrivate, _}
+import coop.rchain.models.rholang.implicits.{GPrivate, _}
 import coop.rchain.rholang.syntax.rholang_mercury.Absyn._
 import monix.eval.Coeval
 import org.scalatest.{FlatSpec, Matchers}
@@ -48,7 +48,7 @@ class CollectPrinterSpec extends FlatSpec with Matchers {
 
   val inputs = ProcVisitInputs(
     Par(),
-    DebruijnIndexMap[VarSort]().newBindings(List(("P", ProcSort, 0, 0), ("x", NameSort, 0, 0))),
+    IndexMapChain[VarSort]().newBindings(List(("P", ProcSort, 0, 0), ("x", NameSort, 0, 0))),
     DebruijnLevelMap[VarSort]())
 
   "List" should "Print" in {
@@ -82,7 +82,7 @@ class CollectPrinterSpec extends FlatSpec with Matchers {
 
 class ProcPrinterSpec extends FlatSpec with Matchers {
 
-  val inputs = ProcVisitInputs(Par(), DebruijnIndexMap[VarSort](), DebruijnLevelMap[VarSort]())
+  val inputs = ProcVisitInputs(Par(), IndexMapChain[VarSort](), DebruijnLevelMap[VarSort]())
 
   val p: Par = Par()
 
@@ -99,7 +99,7 @@ class ProcPrinterSpec extends FlatSpec with Matchers {
       ids = Seq(GPrivate("4"), GPrivate("5"))
     )
     val result = PrettyPrinter().buildString(source)
-    val target = "0 | true | \"2\" | `www.3cheese.com` | 4 | 5"
+    val target = "0 | true | \"2\" | `www.3cheese.com` | Unforgeable(0x34) | Unforgeable(0x35)"
     result shouldBe target
   }
 
@@ -381,7 +381,7 @@ class ProcPrinterSpec extends FlatSpec with Matchers {
     val result =
       PrettyPrinter().buildString(
         ProcNormalizeMatcher.normalizeMatch[Coeval](basicInput1, inputs).value.par)
-    val target = "for( x0, @{for( @{y0}, y1 <- @{Nil} ) { *y1 | y0 | x1 }} <- @{Nil} ) { x0!(x1) }"
+    val target = "for( x0, @{for( @{y0}, y1 <- @{Nil} ) { y0 | x1 | *y1 }} <- @{Nil} ) { x0!(x1) }"
     result shouldBe target
   }
 
@@ -521,7 +521,7 @@ class ProcPrinterSpec extends FlatSpec with Matchers {
     val result =
       PrettyPrinter().buildString(
         ProcNormalizeMatcher.normalizeMatch[Coeval](basicInput, inputs).value.par)
-    result shouldBe "match 47 == 47 { true => new x0 in { x0!(47) } ; false => new x0 in { x0!(47) } }"
+    result shouldBe "match (47 == 47) { true => new x0 in { x0!(47) } ; false => new x0 in { x0!(47) } }"
   }
 
   "PMatch" should "Print" in {
@@ -543,6 +543,14 @@ class ProcPrinterSpec extends FlatSpec with Matchers {
     result shouldBe "for( @{match x0 | x1 { 47 => Nil }} <- @{Nil} ) { Nil }"
   }
 
+  "PMatches" should "display matches" in {
+    val pMatches = new PMatches(new PGround(new GroundInt(1)), new PVar(new ProcVarWildcard()))
+
+    val result = PrettyPrinter(0, 1).buildString(
+      ProcNormalizeMatcher.normalizeMatch[Coeval](pMatches, inputs).value.par)
+
+    result shouldBe "(1 matches _)"
+  }
 }
 
 class IncrementTester extends FlatSpec with Matchers {
@@ -576,7 +584,7 @@ class IncrementTester extends FlatSpec with Matchers {
 
 class NamePrinterSpec extends FlatSpec with Matchers {
 
-  val inputs = NameVisitInputs(DebruijnIndexMap[VarSort](), DebruijnLevelMap[VarSort]())
+  val inputs = NameVisitInputs(IndexMapChain[VarSort](), DebruijnLevelMap[VarSort]())
 
   "NameWildcard" should "Print" in {
     val nw = new NameWildcard()

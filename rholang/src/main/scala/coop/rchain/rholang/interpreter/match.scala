@@ -5,17 +5,17 @@ import cats.implicits._
 import cats.{Eval => _}
 import cats.Foldable
 import coop.rchain.models.Channel.ChannelInstance._
+import coop.rchain.models.Connective.ConnectiveInstance
 import coop.rchain.models.Connective.ConnectiveInstance._
 import coop.rchain.models.Expr.ExprInstance._
 import coop.rchain.models.Var.VarInstance._
 import coop.rchain.models._
 import coop.rchain.rholang.interpreter.SpatialMatcher.OptionalFreeMap
 import coop.rchain.rholang.interpreter.SpatialMatcher.NonDetFreeMap
-import coop.rchain.rholang.interpreter.implicits.{
+import coop.rchain.models.rholang.implicits.{
   fromEList,
   fromExpr,
   BundleLocallyFree,
-  EvalLocallyFree,
   ExprLocallyFree,
   GPrivateLocallyFree,
   MatchCaseLocallyFree,
@@ -85,22 +85,10 @@ object SpatialMatcher {
   type OptionalFreeMap[A] = StateT[Option, FreeMap, A]
   type NonDetFreeMap[A]   = StateT[Stream, FreeMap, A]
 
-  @tailrec
-  def possiblyFind[T, R](prop: T => Option[R], haystack: Seq[T]): Option[R] =
-    haystack match {
-      case Nil => None
-      case head +: rest =>
-        prop(head) match {
-          case None  => possiblyFind(prop, rest)
-          case found => found
-        }
-    }
-
   def emptyMap: FreeMap = Map.empty[Int, Par]
 
   case class ParCount(sends: Int = 0,
                       receives: Int = 0,
-                      evals: Int = 0,
                       news: Int = 0,
                       exprs: Int = 0,
                       matches: Int = 0,
@@ -110,7 +98,6 @@ object SpatialMatcher {
       ParCount(
         sends = op(sends, other.sends),
         receives = op(receives, other.receives),
-        evals = op(evals, other.evals),
         news = op(news, other.news),
         exprs = op(exprs, other.exprs),
         matches = op(matches, other.matches),
@@ -130,7 +117,7 @@ object SpatialMatcher {
   private[this] def noFrees(exprs: Seq[Expr]): Seq[Expr] =
     exprs.filter({ (expr) =>
       expr.exprInstance match {
-        case EVarBody(EVar(Some((v)))) =>
+        case EVarBody(EVar(v)) =>
           v.varInstance match {
             case FreeVar(_)  => false
             case Wildcard(_) => false
@@ -148,7 +135,6 @@ object SpatialMatcher {
       ParCount(
         sends = par.sends.size,
         receives = par.receives.size,
-        evals = par.evals.size,
         news = par.news.size,
         matches = par.matches.size,
         exprs = par.exprs.size,
@@ -159,7 +145,6 @@ object SpatialMatcher {
       ParCount(
         sends = Int.MaxValue,
         receives = Int.MaxValue,
-        evals = Int.MaxValue,
         news = Int.MaxValue,
         matches = Int.MaxValue,
         exprs = Int.MaxValue,
@@ -171,7 +156,7 @@ object SpatialMatcher {
       val pc = ParCount(noFrees(par))
       val wildcard: Boolean = par.exprs.exists { expr =>
         expr.exprInstance match {
-          case EVarBody(EVar(Some(v))) =>
+          case EVarBody(EVar(v)) =>
             v.varInstance match {
               case Wildcard(_) => true
               case FreeVar(_)  => true
@@ -200,6 +185,12 @@ object SpatialMatcher {
           (pMinMax.foldLeft(ParCount.max)(_ min _._1), pMinMax.foldLeft(ParCount())(_ max _._2))
         case ConnNotBody(_) =>
           (ParCount(), ParCount.max)
+        case ConnectiveInstance.Empty =>
+          (ParCount(), ParCount())
+        case _: VarRefBody =>
+          // Variable references should be substituted before going into the matcher.
+          // This should never happen.
+          (ParCount(), ParCount())
       }
   }
 
@@ -211,7 +202,6 @@ object SpatialMatcher {
 
     val sendMax    = math.min(max.sends, par.sends.size - minPrune.sends)
     val receiveMax = math.min(max.receives, par.receives.size - minPrune.receives)
-    val evalMax    = math.min(max.evals, par.evals.size - minPrune.evals)
     val newMax     = math.min(max.news, par.news.size - minPrune.news)
     val exprMax    = math.min(max.exprs, par.exprs.size - minPrune.exprs)
     val matchMax   = math.min(max.matches, par.matches.size - minPrune.matches)
@@ -220,7 +210,6 @@ object SpatialMatcher {
 
     val sendMin    = math.max(min.sends, par.sends.size - maxPrune.sends)
     val receiveMin = math.max(min.receives, par.receives.size - maxPrune.receives)
-    val evalMin    = math.max(min.evals, par.evals.size - maxPrune.evals)
     val newMin     = math.max(min.news, par.news.size - maxPrune.news)
     val exprMin    = math.max(min.exprs, par.exprs.size - maxPrune.exprs)
     val matchMin   = math.max(min.matches, par.matches.size - maxPrune.matches)
@@ -230,7 +219,6 @@ object SpatialMatcher {
     for {
       subSends    <- minMaxSubsets(par.sends, sendMin, sendMax)
       subReceives <- minMaxSubsets(par.receives, receiveMin, receiveMax)
-      subEvals    <- minMaxSubsets(par.evals, evalMin, evalMax)
       subNews     <- minMaxSubsets(par.news, newMin, newMax)
       subExprs    <- minMaxSubsets(par.exprs, exprMin, exprMax)
       subMatches  <- minMaxSubsets(par.matches, matchMin, matchMax)
@@ -239,7 +227,6 @@ object SpatialMatcher {
     } yield
       (Par(subSends._1,
            subReceives._1,
-           subEvals._1,
            subNews._1,
            subExprs._1,
            subMatches._1,
@@ -247,7 +234,6 @@ object SpatialMatcher {
            subBundles._1),
        Par(subSends._2,
            subReceives._2,
-           subEvals._2,
            subNews._2,
            subExprs._2,
            subMatches._2,
@@ -334,19 +320,20 @@ object SpatialMatcher {
         spatialMatch(t, p).flatMap(_ => foldMatch(trem, prem, remainder))
     }
 
-  // This function finds a single matching from a list of patterns and a list of
-  // targets.
-  // Any remaining terms are either grouped with the free variable varLevel or
-  // thrown away with the wildcard. If both are provided, we prefer to capture
-  // terms that can be captured.
-  // tlist is the target list
-  // plist is the pattern list
-  // matcher is a function that does a spatial match between T's
-  // merger is a function that adds a captured T to a par. Used for updating the
-  //   state map.
-  // varLevel: if non-empty, the free variable level where to put the remaining
-  //   T's
-  // wildcard: if true, there is a wildcard in parallel with the pattern list.
+  /** This function finds a single matching from a list of patterns and a list of targets.
+    * Any remaining terms are either grouped with the free variable varLevel or thrown away with the wildcard.
+    * If both are provided, we prefer to capture terms that can be captured.
+    *
+    * @param tlist  the target list
+    * @param plist  the pattern list
+    * @param merger a function that adds a captured T to a par. Used for updating the state map.
+    * @param varLevel if non-empty, the free variable level where to put the remaining T's
+    * @param wildcard if true, there is a wildcard in parallel with the pattern list.
+    * @param lf
+    * @param sm a function that does a spatial match between T's
+    * @tparam T
+    * @return
+    */
   private[this] def listMatchSingleNonDet[T](tlist: Seq[T],
                                              plist: Seq[T],
                                              merger: (Par, T) => Par,
@@ -489,11 +476,23 @@ object SpatialMatcher {
           StateT.liftF(Stream.Empty)
         }
       } else {
+
+        @tailrec
+        def possiblyFind[T, R](prop: T => Option[R], haystack: Seq[T]): Option[R] =
+          haystack match {
+            case Nil => None
+            case head +: rest =>
+              prop(head) match {
+                case None  => possiblyFind(prop, rest)
+                case found => found
+              }
+          }
+
         val varLevel: Option[Int] = possiblyFind[Expr, Int](
           {
             case expr =>
               expr.exprInstance match {
-                case EVarBody(EVar(Some(v))) =>
+                case EVarBody(EVar(v)) =>
                   v.varInstance match {
                     case FreeVar(level) => Some(level)
                     case _              => None
@@ -506,7 +505,7 @@ object SpatialMatcher {
 
         val wildcard: Boolean = pattern.exprs.exists { expr =>
           expr.exprInstance match {
-            case EVarBody(EVar(Some(v))) =>
+            case EVarBody(EVar(v)) =>
               v.varInstance match {
                 case Wildcard(_) => true
                 case _           => false
@@ -515,7 +514,7 @@ object SpatialMatcher {
           }
         }
 
-        val filteredPattern  = pattern.withExprs(noFrees(pattern.exprs))
+        val filteredPattern  = noFrees(pattern)
         val pc               = ParCount(filteredPattern)
         val minRem           = pc
         val maxRem           = if (wildcard || !varLevel.isEmpty) ParCount.max else pc
@@ -540,8 +539,7 @@ object SpatialMatcher {
           } yield sp._2
         }
         for {
-          remainder <- Foldable[List].foldM(connectivesWithBounds, target)(
-                        matchConnectiveWithBounds)
+          remainder <- connectivesWithBounds.foldM(target)(matchConnectiveWithBounds)
           _ <- listMatchSingleNonDet[Send](remainder.sends,
                                            pattern.sends,
                                            (p, s) => p.withSends(s +: p.sends),
@@ -552,11 +550,6 @@ object SpatialMatcher {
                                               (p, s) => p.withReceives(s +: p.receives),
                                               varLevel,
                                               wildcard)
-          _ <- listMatchSingleNonDet[Eval](remainder.evals,
-                                           pattern.evals,
-                                           (p, s) => p.withEvals(s +: p.evals),
-                                           varLevel,
-                                           wildcard)
           _ <- listMatchSingleNonDet[New](remainder.news,
                                           pattern.news,
                                           (p, s) => p.withNews(s +: p.news),
@@ -601,7 +594,7 @@ object SpatialMatcher {
         StateT.liftF(None)
       else
         for {
-          _ <- spatialMatch(target.chan.get, pattern.chan.get)
+          _ <- spatialMatch(target.chan, pattern.chan)
           _ <- foldMatch(target.data, pattern.data)
         } yield Unit
   }
@@ -613,19 +606,14 @@ object SpatialMatcher {
       else
         for {
           _ <- listMatchSingle[ReceiveBind](target.binds, pattern.binds, (p, rb) => p, None, false)
-          _ <- spatialMatch(target.body.get, pattern.body.get)
+          _ <- spatialMatch(target.body, pattern.body)
         } yield Unit
     }
-
-  implicit val evalSpatialMatcherInstance: SpatialMatcher[Eval, Eval] = fromFunction[Eval, Eval] {
-    (target, pattern) =>
-      spatialMatch(target.channel.get, pattern.channel.get)
-  }
 
   implicit val newSpatialMatcherInstance: SpatialMatcher[New, New] = fromFunction[New, New] {
     (target, pattern) =>
       if (target.bindCount == pattern.bindCount)
-        spatialMatch(target.p.get, pattern.p.get)
+        spatialMatch(target.p, pattern.p)
       else
         StateT.liftF(None)
   }
@@ -648,23 +636,25 @@ object SpatialMatcher {
         }
         case (EVarBody(EVar(vp)), EVarBody(EVar(vt))) =>
           if (vp == vt) StateT.pure(Unit) else StateT.liftF(None)
-        case (ENotBody(ENot(t)), ENotBody(ENot(p))) => spatialMatch(t.get, p.get)
-        case (ENegBody(ENeg(t)), ENegBody(ENeg(p))) => spatialMatch(t.get, p.get)
+        case (ENotBody(ENot(t)), ENotBody(ENot(p))) => spatialMatch(t, p)
+        case (ENegBody(ENeg(t)), ENegBody(ENeg(p))) => spatialMatch(t, p)
         case (EMultBody(EMult(t1, t2)), EMultBody(EMult(p1, p2))) =>
           for {
-            _ <- spatialMatch(t1.get, p1.get)
-            _ <- spatialMatch(t2.get, p2.get)
+            _ <- spatialMatch(t1, p1)
+            _ <- spatialMatch(t2, p2)
           } yield Unit
         case (EDivBody(EDiv(t1, t2)), EDivBody(EDiv(p1, p2))) =>
           for {
-            _ <- spatialMatch(t1.get, p1.get)
-            _ <- spatialMatch(t2.get, p2.get)
+            _ <- spatialMatch(t1, p1)
+            _ <- spatialMatch(t2, p2)
           } yield Unit
         case (EPlusBody(EPlus(t1, t2)), EPlusBody(EPlus(p1, p2))) =>
           for {
-            _ <- spatialMatch(t1.get, p1.get)
-            _ <- spatialMatch(t2.get, p2.get)
+            _ <- spatialMatch(t1, p1)
+            _ <- spatialMatch(t2, p2)
           } yield Unit
+        case (EEvalBody(chan1), EEvalBody(chan2)) =>
+          spatialMatch(chan1, chan2)
         case _ => StateT.liftF(None)
       }
   }
@@ -672,7 +662,7 @@ object SpatialMatcher {
   implicit val matchSpatialMatcherInstance: SpatialMatcher[Match, Match] =
     fromFunction[Match, Match] { (target, pattern) =>
       for {
-        _ <- spatialMatch(target.target.get, pattern.target.get)
+        _ <- spatialMatch(target.target, pattern.target)
         _ <- foldMatch(target.cases, pattern.cases)
       } yield Unit
     }
@@ -720,7 +710,7 @@ object SpatialMatcher {
       if (target.patterns != pattern.patterns)
         StateT.liftF[Option, FreeMap, Unit](None)
       else
-        spatialMatch(target.source.get, pattern.source.get)
+        spatialMatch(target.source, pattern.source)
     }
 
   implicit val matchCaseSpatialMatcherInstance: SpatialMatcher[MatchCase, MatchCase] =
@@ -728,7 +718,7 @@ object SpatialMatcher {
       if (target.pattern != pattern.pattern)
         StateT.liftF(None)
       else
-        spatialMatch(target.source.get, pattern.source.get)
+        spatialMatch(target.source, pattern.source)
     }
 
   // This matches a single logical connective against a Par. If it can match
@@ -761,6 +751,12 @@ object SpatialMatcher {
               case Some((_, _)) => None
             }
           })
+        case _: VarRefBody =>
+          // this should never happen because variable references should be substituted
+          StateT.liftF(None)
+
+        case ConnectiveInstance.Empty =>
+          StateT.liftF(None)
       }
     }
 }

@@ -10,7 +10,7 @@ object Dependencies {
 
   // format: off
   val bitcoinjCore        = "org.bitcoinj"                % "bitcoinj-core"             % "0.14.6"
-  val bouncyCastle        = "org.bouncycastle"            % "bcprov-jdk15on"            % "1.58"
+  val bouncyCastle        = "org.bouncycastle"            % "bcprov-jdk15on"            % "1.59"
   val catsCore            = "org.typelevel"              %% "cats-core"                 % "1.0.1"
   val catsMtl             = "org.typelevel"              %% "cats-mtl-core"             % "0.2.1"
   val circeCore           = "io.circe"                   %% "circe-core"                % circeVersion
@@ -29,15 +29,17 @@ object Dependencies {
   val kalium              = "org.abstractj.kalium"        % "kalium"                    % "0.7.0"
   val kamonCore           = "io.kamon"                   %% "kamon-core"                % kamonVersion
   val kamonPrometheus     = "io.kamon"                   %% "kamon-prometheus"          % kamonVersion
-  val lmdbjava            = "org.lmdbjava"                % "lmdbjava"                  % "0.6.0"
+  val lmdbjava            = "org.lmdbjava"                % "lmdbjava"                  % "0.6.1"
   val logbackClassic      = "ch.qos.logback"              % "logback-classic"           % "1.2.3"
   val monix               = "io.monix"                   %% "monix"                     % "3.0.0-RC1"
   val scalaLogging        = "com.typesafe.scala-logging" %% "scala-logging"             % "3.7.2"
   val scalaUri            = "io.lemonlabs"               %% "scala-uri"                 % "0.5.0"
   val scalacheck          = "org.scalacheck"             %% "scalacheck"                % "1.13.4" % "test"
+  val scalacheckNoTest    = "org.scalacheck"             %% "scalacheck"                % "1.13.4"
   val scalacheckShapeless = "com.github.alexarchambault" %% "scalacheck-shapeless_1.13" % "1.1.8" % "test"
   val scalactic           = "org.scalactic"              %% "scalactic"                 % "3.0.1" % "test"
   val scalapbRuntime      = "com.thesamet.scalapb"       %% "scalapb-runtime"           % scalapb.compiler.Version.scalapbVersion % "protobuf"
+  val scalapbRuntimeLib   = "com.thesamet.scalapb"       %% "scalapb-runtime"           % scalapb.compiler.Version.scalapbVersion
   val scalapbRuntimegGrpc = "com.thesamet.scalapb"       %% "scalapb-runtime-grpc"      % scalapb.compiler.Version.scalapbVersion
   val grpcNetty           = "io.grpc"                     % "grpc-netty"                % scalapb.compiler.Version.grpcJavaVersion
   val nettyBoringSsl      = "io.netty"                    % "netty-tcnative-boringssl-static" % "2.0.8.Final"
@@ -51,6 +53,7 @@ object Dependencies {
   val scodecBits          = "org.scodec"                 %% "scodec-bits"               % "1.1.5"
   val shapeless           = "com.chuusai"                %% "shapeless"                 % "2.3.2"
   val weupnp              = "org.bitlet"                  % "weupnp"                    % "0.1.+"
+  val secp256k1Java       = "coop.rchain"                 % "secp256k1-java"            % "0.1-SNAPSHOT"
 
   // format: on
 
@@ -68,6 +71,9 @@ object Dependencies {
 
   val protobufDependencies: Seq[ModuleID] =
     Seq(scalapbRuntime)
+
+  val protobufLibDependencies: Seq[ModuleID] =
+    Seq(scalapbRuntimeLib)
 
   val kamonDependencies: Seq[ModuleID] =
     Seq(kamonCore, kamonPrometheus)

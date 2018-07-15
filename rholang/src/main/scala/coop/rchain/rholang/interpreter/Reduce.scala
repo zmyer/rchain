@@ -1,25 +1,35 @@
 package coop.rchain.rholang.interpreter
 
+import cats.effect.Sync
 import cats.implicits._
-import cats.{Applicative, Parallel, Eval => _}
+import cats.{Applicative, FlatMap, Parallel, Eval => _}
+import cats.mtl.implicits._
+import cats.mtl.{FunctorTell, MonadState}
 import com.google.protobuf.ByteString
 import coop.rchain.catscontrib.Capture
 import coop.rchain.crypto.codec.Base16
+import coop.rchain.crypto.hash.Blake2b512Random
+import coop.rchain.models.Channel.ChannelInstance
 import coop.rchain.models.Channel.ChannelInstance.{ChanVar, Quote}
+import coop.rchain.models.Expr.ExprInstance
 import coop.rchain.models.Expr.ExprInstance._
+import coop.rchain.models.ListChannelWithRandom
 import coop.rchain.models.TaggedContinuation.TaggedCont.ParBody
+import coop.rchain.models.Var.VarInstance
 import coop.rchain.models.Var.VarInstance.{BoundVar, FreeVar, Wildcard}
-import coop.rchain.models.implicits._
+import coop.rchain.models.rholang.implicits._
+import coop.rchain.models.rholang.sort.ordering._
+import coop.rchain.models.serialization.implicits._
 import coop.rchain.models.{Match, MatchCase, GPrivate => _, _}
 import coop.rchain.rholang.interpreter.Substitute._
-import coop.rchain.rholang.interpreter.errors.{InterpreterErrorsM, ReduceError, _}
-import coop.rchain.rholang.interpreter.implicits._
+import coop.rchain.rholang.interpreter.errors._
 import coop.rchain.rholang.interpreter.storage.implicits._
-import coop.rchain.rspace.pure.{consume => internalConsume, produce => internalProduce}
-import coop.rchain.rspace.{IStore, Serialize}
+import coop.rchain.rspace.Serialize
+import coop.rchain.rspace.pure.PureRSpace
 
 import scala.collection.immutable.BitSet
 import scala.util.Try
+import monix.eval.Coeval
 
 // Notes: Caution, a type annotation is often needed for Env.
 
@@ -29,14 +39,16 @@ import scala.util.Try
   */
 trait Reduce[M[_]] {
 
-  def produce(chan: Quote, data: Seq[Par], persistent: Boolean)(implicit env: Env[Par]): M[Unit]
+  def produce(chan: Quote, data: Seq[Par], persistent: Boolean)(implicit env: Env[Par],
+                                                                rand: Blake2b512Random): M[Unit]
 
   def consume(binds: Seq[(BindPattern, Quote)], body: Par, persistent: Boolean)(
-      implicit env: Env[Par]): M[Unit]
+      implicit env: Env[Par],
+      rand: Blake2b512Random): M[Unit]
 
-  def eval(par: Par)(implicit env: Env[Par]): M[Unit]
+  def eval(par: Par)(implicit env: Env[Par], rand: Blake2b512Random): M[Unit]
 
-  def inj(par: Par): M[Unit]
+  def inj(par: Par)(implicit rand: Blake2b512Random): M[Unit]
 
   /**
     * Evaluate any top level expressions in @param Par .
@@ -48,10 +60,17 @@ trait Reduce[M[_]] {
 
 object Reduce {
 
-  class DebruijnInterpreter[M[_]: InterpreterErrorsM: Capture, F[_]](
-      tupleSpace: IStore[Channel, BindPattern, Seq[Channel], TaggedContinuation],
-      dispatcher: => Dispatch[M, Seq[Channel], TaggedContinuation])(
-      implicit parallel: cats.Parallel[M, F])
+  class DebruijnInterpreter[M[_], F[_]](
+      tupleSpace: PureRSpace[M,
+                             Channel,
+                             BindPattern,
+                             ListChannelWithRandom,
+                             ListChannelWithRandom,
+                             TaggedContinuation],
+      dispatcher: => Dispatch[M, ListChannelWithRandom, TaggedContinuation])(
+      implicit parallel: cats.Parallel[M, F],
+      s: Sync[M],
+      fTell: FunctorTell[M, Throwable])
       extends Reduce[M] {
 
     type Cont[Data, Body] = (Body, Env[Data])
@@ -66,9 +85,10 @@ object Reduce {
       * @return  An optional continuation resulting from a match in the tuplespace.
       */
     override def produce(chan: Quote, data: Seq[Par], persistent: Boolean)(
-        implicit env: Env[Par]): M[Unit] = {
+        implicit env: Env[Par],
+        rand: Blake2b512Random): M[Unit] = {
       // TODO: Handle the environment in the store
-      def go(res: Option[(TaggedContinuation, Seq[Seq[Channel]])]) =
+      def go(res: Option[(TaggedContinuation, Seq[ListChannelWithRandom])]) =
         res match {
           case Some((continuation, dataList)) =>
             if (persistent) {
@@ -78,14 +98,16 @@ object Reduce {
               dispatcher.dispatch(continuation, dataList)
             }
           case None =>
-            Applicative[M].pure(())
+            s.unit
         }
 
       for {
         substData <- data.toList.traverse(
-                      substitutePar[M].substitute(_).map(p => Channel(Quote(p))))
-        res <- internalProduce(tupleSpace, Channel(chan), substData, persist = persistent)
-        _   <- go(res)
+                      substitutePar[M].substitute(_)(0, env).map(p => Channel(Quote(p))))
+        res <- tupleSpace.produce(Channel(chan),
+                                  ListChannelWithRandom(substData, rand),
+                                  persist = persistent)
+        _ <- go(res)
       } yield ()
     }
 
@@ -101,26 +123,29 @@ object Reduce {
       *          will be @param body if the continuation is not None.
       */
     override def consume(binds: Seq[(BindPattern, Quote)], body: Par, persistent: Boolean)(
-        implicit env: Env[Par]): M[Unit] =
+        implicit env: Env[Par],
+        rand: Blake2b512Random): M[Unit] =
       binds match {
-        case Nil => interpreterErrorM[M].raiseError(ReduceError("Error: empty binds"))
+        case Nil => s.raiseError(ReduceError("Error: empty binds"))
         case _ =>
           val (patterns: Seq[BindPattern], sources: Seq[Quote]) = binds.unzip
-          internalConsume(tupleSpace,
-                          sources.map(q => Channel(q)).toList,
-                          patterns.toList,
-                          TaggedContinuation(ParBody(body)),
-                          persist = persistent).flatMap {
-            case Some((continuation, dataList)) =>
-              dispatcher.dispatch(continuation, dataList)
-              if (persistent) {
-                List(dispatcher.dispatch(continuation, dataList), consume(binds, body, persistent)).parSequence
-                  .map(_ => ())
-              } else {
+          tupleSpace
+            .consume(sources.map(q => Channel(q)).toList,
+                     patterns.toList,
+                     TaggedContinuation(ParBody(ParWithRandom(body, rand))),
+                     persist = persistent)
+            .flatMap {
+              case Some((continuation, dataList)) =>
                 dispatcher.dispatch(continuation, dataList)
-              }
-            case None => Applicative[M].pure(())
-          }
+                if (persistent) {
+                  List(dispatcher.dispatch(continuation, dataList),
+                       consume(binds, body, persistent)).parSequence
+                    .map(_ => ())
+                } else {
+                  dispatcher.dispatch(continuation, dataList)
+                }
+              case None => Applicative[M].pure(())
+            }
       }
 
     /** WanderUnordered is the non-deterministic analogue
@@ -134,46 +159,75 @@ object Reduce {
       * @param par
       * @return
       */
-    override def eval(par: Par)(implicit env: Env[Par]): M[Unit] =
+    override def eval(par: Par)(implicit env: Env[Par], rand: Blake2b512Random): M[Unit] = {
+      val filteredExprs = par.exprs.filter { expr =>
+        expr.exprInstance match {
+          case _: EVarBody    => true
+          case _: EEvalBody   => true
+          case _: EMethodBody => true
+          case _              => false
+        }
+      }
+      val starts = Vector(par.sends.size,
+                          par.receives.size,
+                          par.news.size,
+                          par.matches.size,
+                          par.bundles.size,
+                          filteredExprs.size)
+        .scanLeft(0)(_ + _)
+      def handle[A](eval: (A => (Env[Par], Blake2b512Random) => M[Unit]), start: Int)(
+          ta: (A, Int)): M[Unit] = {
+        val newRand =
+          if (starts(6) == 1)
+            rand
+          else if (starts(6) > 256)
+            rand.splitShort((start + ta._2).toShort)
+          else
+            rand.splitByte((start + ta._2).toByte)
+        eval(ta._1)(env, newRand).handleError(fTell.tell)
+      }
       List(
-        Parallel.parTraverse(par.sends.toList)(send => eval(send)),
-        Parallel.parTraverse(par.receives.toList)(recv => eval(recv)),
-        Parallel.parTraverse(par.news.toList)(neu => eval(neu)),
-        Parallel.parTraverse(par.evals.toList)(deref => eval(deref)),
-        Parallel.parTraverse(par.matches.toList)(mat => eval(mat)),
-        Parallel.parTraverse(par.bundles.toList)(bundle => eval(bundle)),
-        Parallel.parTraverse(par.exprs.filter { expr =>
-          expr.exprInstance match {
-            case _: EVarBody    => true
-            case _: EMethodBody => true
-            case _              => false
-          }
-        }.toList)(expr =>
+        Parallel.parTraverse(par.sends.zipWithIndex.toList)(handle(evalExplicit, starts(0))),
+        Parallel.parTraverse(par.receives.zipWithIndex.toList)(handle(evalExplicit, starts(1))),
+        Parallel.parTraverse(par.news.zipWithIndex.toList)(handle(evalExplicit, starts(2))),
+        Parallel.parTraverse(par.matches.zipWithIndex.toList)(handle(evalExplicit, starts(3))),
+        Parallel.parTraverse(par.bundles.zipWithIndex.toList)(handle(evalExplicit, starts(4))),
+        Parallel.parTraverse(filteredExprs.zipWithIndex.toList)(texpr => {
+          val (expr, idx) = texpr
+          val newRand =
+            if (starts(6) == 1)
+              rand
+            else if (starts(6) > 256)
+              rand.splitShort((starts(5) + idx).toShort)
+            else
+              rand.splitByte((starts(5) + idx).toByte)
           expr.exprInstance match {
             case EVarBody(EVar(v)) =>
-              for {
+              (for {
                 varref <- eval(v.get)
-                _      <- eval(varref)
-              } yield ()
-            case e: EMethodBody =>
-              for {
+                _      <- eval(varref)(env, newRand)
+              } yield ()).handleError(fTell.tell)
+            case e: EEvalBody =>
+              (for {
                 p <- evalExprToPar(Expr(e))
-                _ <- eval(p)
-              } yield ()
+                _ <- eval(p)(env, newRand)
+              } yield ()).handleError(fTell.tell)
+            case e: EMethodBody =>
+              (for {
+                p <- evalExprToPar(Expr(e))
+                _ <- eval(p)(env, newRand)
+              } yield ()).handleError(fTell.tell)
             case _ => Applicative[M].pure(())
+          }
         })
       ).parSequence.map(_ => ())
-
-    override def inj(par: Par): M[Unit] =
-      for { _ <- eval(par)(Env[Par]()) } yield ()
-
-    def debug(msg: String): Unit = {
-      val now = java.time.format.DateTimeFormatter.ISO_INSTANT
-        .format(java.time.Instant.now)
-        .substring(11, 23)
-      val thread = Thread.currentThread.getName
-      println(s"$now [$thread]" + "\n" + msg)
     }
+
+    override def inj(par: Par)(implicit rand: Blake2b512Random): M[Unit] =
+      for { _ <- eval(par)(Env[Par](), rand) } yield ()
+
+    def evalExplicit(send: Send)(env: Env[Par], rand: Blake2b512Random): M[Unit] =
+      eval(send)(env, rand)
 
     /** Algorithm as follows:
       *
@@ -188,34 +242,40 @@ object Reduce {
       * @param env An execution context
       * @return
       */
-    def eval(send: Send)(implicit env: Env[Par]): M[Unit] =
+    def eval(send: Send)(implicit env: Env[Par], rand: Blake2b512Random): M[Unit] =
       for {
-        quote <- eval(send.chan.get)
+        quote <- eval(send.chan)
         data  <- send.data.toList.traverse(x => evalExpr(x))
 
-        subChan <- substituteQuote[M].substitute(quote)
+        subChan <- substituteQuote[M].substitute(quote)(0, env)
         unbundled <- subChan.value.singleBundle() match {
                       case Some(value) =>
                         if (!value.writeFlag) {
-                          interpreterErrorM[M].raiseError(
-                            ReduceError("Trying to send on non-writeable channel."))
+                          s.raiseError(ReduceError("Trying to send on non-writeable channel."))
                         } else {
-                          interpreterErrorM[M].pure(Quote(value.body.get))
+                          s.pure(Quote(value.body.get))
                         }
                       case None => Applicative[M].pure(subChan)
                     }
         _ <- produce(unbundled, data, send.persistent)
       } yield ()
 
-    def eval(receive: Receive)(implicit env: Env[Par]): M[Unit] =
+    def evalExplicit(receive: Receive)(env: Env[Par], rand: Blake2b512Random): M[Unit] =
+      eval(receive)(env, rand)
+    def eval(receive: Receive)(implicit env: Env[Par], rand: Blake2b512Random): M[Unit] =
       for {
         binds <- receive.binds.toList
                   .traverse(rb =>
-                    unbundleReceive(rb).map(q =>
-                      (BindPattern(rb.patterns, rb.remainder, rb.freeCount), q)))
+                    for {
+                      q <- unbundleReceive(rb)
+                      substPatterns <- rb.patterns.toList.traverse(pattern =>
+                                        substituteChannel[M].substitute(pattern)(1, env))
+                    } yield (BindPattern(substPatterns, rb.remainder, rb.freeCount), q))
         // TODO: Allow for the environment to be stored with the body in the Tuplespace
-        substBody <- substitutePar[M].substitute(receive.body.get)(env.shift(receive.bindCount))
-        _         <- consume(binds, substBody, receive.persistent)
+        substBody <- substitutePar[M].substituteNoSort(receive.body.get)(
+                      0,
+                      env.shift(receive.bindCount))
+        _ <- consume(binds, substBody, receive.persistent)
       } yield ()
 
     /**
@@ -233,17 +293,16 @@ object Reduce {
       valproc.varInstance match {
         case BoundVar(level) =>
           env.get(level) match {
-            case Some(par) => interpreterErrorM[M].pure(par)
+            case Some(par) => s.pure(par)
             case None =>
-              interpreterErrorM[M].raiseError(
-                ReduceError("Unbound variable: " + level + " in " + env.envMap))
+              s.raiseError(ReduceError("Unbound variable: " + level + " in " + env.envMap))
           }
         case Wildcard(_) =>
-          interpreterErrorM[M].raiseError(
-            ReduceError("Unbound variable: attempting to evaluate a pattern"))
+          s.raiseError(ReduceError("Unbound variable: attempting to evaluate a pattern"))
         case FreeVar(_) =>
-          interpreterErrorM[M].raiseError(
-            ReduceError("Unbound variable: attempting to evaluate a pattern"))
+          s.raiseError(ReduceError("Unbound variable: attempting to evaluate a pattern"))
+        case VarInstance.Empty =>
+          s.raiseError(ReduceError("Impossible var instance EMPTY"))
       }
 
     /**
@@ -269,9 +328,13 @@ object Reduce {
             par    <- eval(varue)
             evaled <- evalExpr(par)
           } yield Quote(evaled)
+        case ChannelInstance.Empty =>
+          s.raiseError(ReduceError("Impossible channel instance EMPTY"))
       }
 
-    def eval(mat: Match)(implicit env: Env[Par]): M[Unit] = {
+    def evalExplicit(mat: Match)(env: Env[Par], rand: Blake2b512Random): M[Unit] =
+      eval(mat)(env, rand)
+    def eval(mat: Match)(implicit env: Env[Par], rand: Blake2b512Random): M[Unit] = {
       def addToEnv(env: Env[Par], freeMap: Map[Int, Par], freeCount: Int): Env[Par] =
         Range(0, freeCount).foldLeft(env)(
           (acc, e) =>
@@ -283,28 +346,36 @@ object Reduce {
           )
         )
 
-      @annotation.tailrec
-      def firstMatch(target: Par, cases: Seq[MatchCase])(implicit env: Env[Par]): M[Unit] =
-        cases match {
-          case Nil => Applicative[M].pure(())
-          case singleCase +: caseRem =>
-            val matchResult = SpatialMatcher
-              .spatialMatch(target, singleCase.pattern.get)
-              .runS(SpatialMatcher.emptyMap)
-            matchResult match {
-              case None => firstMatch(target, caseRem)
-              case Some(freeMap) => {
-                val newEnv: Env[Par] = addToEnv(env, freeMap, singleCase.freeCount)
-                eval(singleCase.source.get)(newEnv)
+      def firstMatch(target: Par, cases: Seq[MatchCase])(implicit env: Env[Par]): M[Unit] = {
+        def firstMatchM(
+            state: Tuple2[Par, Seq[MatchCase]]): M[Either[Tuple2[Par, Seq[MatchCase]], Unit]] = {
+          val (target, cases) = state
+          cases match {
+            case Nil => Applicative[M].pure(Right(()))
+            case singleCase +: caseRem =>
+              substitutePar[M].substitute(singleCase.pattern.get)(1, env).flatMap { pattern =>
+                val matchResult =
+                  SpatialMatcher
+                    .spatialMatch(target, pattern)
+                    .runS(SpatialMatcher.emptyMap)
+                matchResult match {
+                  case None => Applicative[M].pure(Left((target, caseRem)))
+                  case Some(freeMap) => {
+                    val newEnv: Env[Par] = addToEnv(env, freeMap, singleCase.freeCount)
+                    eval(singleCase.source.get)(newEnv, implicitly).map(Right(_))
+                  }
+                }
               }
-            }
+          }
         }
+        FlatMap[M].tailRecM[Tuple2[Par, Seq[MatchCase]], Unit]((target, cases))(firstMatchM)
+      }
 
       for {
         evaledTarget <- evalExpr(mat.target.get)
         // TODO(kyle): Make the matcher accept an environment, instead of
         // substituting it.
-        substTarget <- substitutePar[M].substitute(evaledTarget)(env)
+        substTarget <- substitutePar[M].substitute(evaledTarget)(0, env)
         _           <- firstMatch(substTarget, mat.cases)
       } yield ()
     }
@@ -316,53 +387,39 @@ object Reduce {
       * @param neu
       * @return
       */
-    def eval(neu: New)(implicit env: Env[Par]): M[Unit] = {
+    def evalExplicit(neu: New)(env: Env[Par], rand: Blake2b512Random): M[Unit] =
+      eval(neu)(env, rand)
+    def eval(neu: New)(implicit env: Env[Par], rand: Blake2b512Random): M[Unit] = {
       def alloc(level: Int): Env[Par] =
         (env /: (0 until level).toList) { (_env, _) =>
-          val addr: Par = GPrivate()
+          val addr: Par = GPrivate(ByteString.copyFrom(rand.next()))
           _env.put(addr)
         }
 
-      eval(neu.p.get)(alloc(neu.bindCount))
+      eval(neu.p.get)(alloc(neu.bindCount), rand)
     }
 
     private[this] def unbundleReceive(rb: ReceiveBind)(implicit env: Env[Par]): M[Quote] =
       for {
         quote <- eval(rb.source.get)
-        subst <- substituteQuote[M].substitute(quote)
+        subst <- substituteQuote[M].substitute(quote)(0, env)
         // Check if we try to read from bundled channel
         unbndl <- subst.quote.get.singleBundle() match {
                    case Some(value) =>
                      if (!value.readFlag) {
-                       interpreterErrorM[M].raiseError(
-                         ReduceError("Trying to read from non-readable channel."))
+                       s.raiseError(ReduceError("Trying to read from non-readable channel."))
                      } else {
-                       interpreterErrorM[M].pure(Quote(value.body.get))
+                       s.pure(Quote(value.body.get))
                      }
                    case None =>
-                     interpreterErrorM[M].pure(subst)
+                     s.pure(subst)
                  }
       } yield unbndl
 
-    /**
-      * Eval is well-defined on channel variables provided
-      * a binding exists for the variable. It simply gets the
-      * quoted process and calls eval.
-      */
-    def eval(drop: Eval)(implicit env: Env[Par]): M[Unit] =
-      for {
-        quote <- eval(drop.channel.get)
-        _     <- eval(quote.value)
-      } yield ()
-
-    def eval(bundle: Bundle)(implicit env: Env[Par]): M[Unit] =
+    def evalExplicit(bundle: Bundle)(env: Env[Par], rand: Blake2b512Random): M[Unit] =
+      eval(bundle)(env, rand)
+    def eval(bundle: Bundle)(implicit env: Env[Par], rand: Blake2b512Random): M[Unit] =
       eval(bundle.body.get)
-
-    /**
-      * Continue is straightforward in this case, it just calls eval.
-      */
-    def continue(body: Par)(implicit env: Env[Par]): M[Unit] =
-      eval(body)
 
     def evalExprToPar(expr: Expr)(implicit env: Env[Par]): M[Par] =
       expr.exprInstance match {
@@ -378,13 +435,13 @@ object Reduce {
             evaledArgs   <- arguments.toList.traverse(expr => evalExpr(expr))
             resultPar <- methodLookup match {
                           case None =>
-                            interpreterErrorM[M].raiseError(
-                              ReduceError("Unimplemented method: " + method))
+                            s.raiseError(ReduceError("Unimplemented method: " + method))
                           case Some(f) => f(target.get, evaledArgs)(env)
                         }
           } yield resultPar
         }
-        case _ => evalExprToExpr(expr).map(e => (fromExpr(e)(identity)))
+        case EEvalBody(chan) => eval(chan).map(q => q.value)
+        case _               => evalExprToExpr(expr).map(e => fromExpr(e)(identity))
       }
 
     def evalExprToExpr(expr: Expr)(implicit env: Env[Par]): M[Expr] = {
@@ -401,8 +458,7 @@ object Reduce {
                      case (GInt(i1), GInt(i2))       => Applicative[M].pure(GBool(relopi(i1, i2)))
                      case (GString(s1), GString(s2)) => Applicative[M].pure(GBool(relops(s1, s2)))
                      case _ =>
-                       interpreterErrorM[M].raiseError(
-                         ReduceError("Unexpected compare: " + v1 + " vs. " + v2))
+                       s.raiseError(ReduceError("Unexpected compare: " + v1 + " vs. " + v2))
                    }
         } yield result
 
@@ -449,15 +505,15 @@ object Reduce {
             v1 <- evalExpr(p1.get)
             v2 <- evalExpr(p2.get)
             // TODO: build an equality operator that takes in an environment.
-            sv1 <- substitutePar[M].substitute(v1)
-            sv2 <- substitutePar[M].substitute(v2)
+            sv1 <- substitutePar[M].substitute(v1)(0, env)
+            sv2 <- substitutePar[M].substitute(v2)(0, env)
           } yield GBool(sv1 == sv2)
         case ENeqBody(ENeq(p1, p2)) =>
           for {
             v1  <- evalExpr(p1.get)
             v2  <- evalExpr(p2.get)
-            sv1 <- substitutePar[M].substitute(v1)
-            sv2 <- substitutePar[M].substitute(v2)
+            sv1 <- substitutePar[M].substitute(v1)(0, env)
+            sv2 <- substitutePar[M].substitute(v2)(0, env)
           } yield GBool(sv1 != sv2)
         case EAndBody(EAnd(p1, p2)) =>
           for {
@@ -469,6 +525,19 @@ object Reduce {
             b1 <- evalToBool(p1.get)
             b2 <- evalToBool(p2.get)
           } yield GBool(b1 || b2)
+
+        case EMatchesBody(EMatches(target, pattern)) =>
+          for {
+            evaledTarget <- evalExpr(target)
+            substTarget  <- substitutePar[M].substitute(evaledTarget)(0, env)
+            substPattern <- substitutePar[M].substitute(pattern)(1, env)
+          } yield
+            (GBool(
+              SpatialMatcher
+                .spatialMatch(substTarget, substPattern)
+                .runS(SpatialMatcher.emptyMap)
+                .isDefined))
+
         case EVarBody(EVar(v)) =>
           for {
             p       <- eval(v.get)
@@ -480,6 +549,29 @@ object Reduce {
             updatedPs = evaledPs.map(updateLocallyFree)
           } yield updateLocallyFree(EList(updatedPs, el.locallyFree, el.connectiveUsed))
         }
+        case ETupleBody(el) =>
+          for {
+            evaledPs  <- el.ps.toList.traverse(expr => evalExpr(expr))
+            updatedPs = evaledPs.map(updateLocallyFree)
+          } yield updateLocallyFree(ETuple(updatedPs, el.locallyFree, el.connectiveUsed))
+
+        case ESetBody(set) =>
+          for {
+            evaledPs  <- set.ps.sortedPars.traverse(expr => evalExpr(expr))
+            updatedPs = evaledPs.map(updateLocallyFree)
+          } yield set.copy(ps = SortedParHashSet(updatedPs))
+
+        case EMapBody(map) =>
+          for {
+            evaledPs <- map.ps.sortedMap.traverse {
+                         case (key, value) =>
+                           for {
+                             eKey   <- evalExpr(key).map(updateLocallyFree)
+                             eValue <- evalExpr(value).map(updateLocallyFree)
+                           } yield (eKey, eValue)
+                       }
+          } yield map.copy(ps = SortedParMap(evaledPs))
+
         case EMethodBody(EMethod(method, target, arguments, _, _)) => {
           val methodLookup = methodTable(method)
           for {
@@ -487,18 +579,24 @@ object Reduce {
             evaledArgs   <- arguments.toList.traverse(expr => evalExpr(expr))
             resultPar <- methodLookup match {
                           case None =>
-                            interpreterErrorM[M].raiseError(
-                              ReduceError("Unimplemented method: " + method))
+                            s.raiseError(ReduceError("Unimplemented method: " + method))
                           case Some(f) => f(target.get, evaledArgs)(env)
                         }
             resultExpr <- evalSingleExpr(resultPar)
           } yield resultExpr
         }
-        case _ => interpreterErrorM[M].raiseError(ReduceError("Unimplemented expression: " + expr))
+        case EEvalBody(chan) =>
+          for {
+            q      <- eval(chan)
+            result <- evalSingleExpr(q.value)
+          } yield result
+        case _ => s.raiseError(ReduceError("Unimplemented expression: " + expr))
       }
     }
 
-    private[this] def nth: (Par, Seq[Par]) => Env[Par] => M[Par] = {
+    type MethodType = (Par, Seq[Par]) => Env[Par] => M[Par]
+
+    private[this] def nth: MethodType = {
       def localNth(ps: Seq[Par], nth: Int): Either[ReduceError, Par] =
         if (ps.isDefinedAt(nth)) {
           Right(ps(nth))
@@ -509,18 +607,18 @@ object Reduce {
       (p: Par, args: Seq[Par]) => (env: Env[Par]) =>
         {
           if (args.length != 1) {
-            interpreterErrorM[M].raiseError(ReduceError("Error: nth expects 1 argument"))
+            s.raiseError(ReduceError("Error: nth expects 1 argument"))
           } else {
             for {
               nth <- evalToInt(args(0))(env)
               v   <- evalSingleExpr(p)(env)
               result <- v.exprInstance match {
                          case EListBody(EList(ps, _, _, _)) =>
-                           interpreterErrorM[M].fromEither(localNth(ps, nth))
+                           s.fromEither(localNth(ps, nth))
                          case ETupleBody(ETuple(ps, _, _)) =>
-                           interpreterErrorM[M].fromEither(localNth(ps, nth))
+                           s.fromEither(localNth(ps, nth))
                          case _ =>
-                           interpreterErrorM[M].raiseError(
+                           s.raiseError(
                              ReduceError(
                                "Error: nth applied to something that wasn't a list or tuple."))
                        }
@@ -529,72 +627,234 @@ object Reduce {
         }
     }
 
-    private[this] def toByteArray: (Par, Seq[Par]) => Env[Par] => M[Par] = {
+    private[this] def toByteArray: MethodType = {
       def serialize(p: Par): Either[ReduceError, Array[Byte]] =
         Either
-          .fromTry(Try(Serialize[Par].encode(p)))
+          .fromTry(Try(Serialize[Par].encode(p).toArray))
           .leftMap(th =>
             ReduceError(s"Error: exception thrown when serializing $p." + th.getMessage))
 
       (p: Par, args: Seq[Par]) => (env: Env[Par]) =>
         {
           if (args.nonEmpty) {
-            interpreterErrorM[M].raiseError(
-              ReduceError("Error: toByteArray does not take arguments"))
+            s.raiseError(ReduceError("Error: toByteArray does not take arguments"))
           } else {
             evalExpr(p)(env)
               .map(serialize(_))
-              .flatMap(interpreterErrorM[M].fromEither)
+              .flatMap(s.fromEither)
               .map(b => Expr(GByteArray(ByteString.copyFrom(b))))
           }
         }
     }
 
-    private[this] def hexToBytes: (Par, Seq[Par]) => Env[Par] => M[Par] = {
-      (p: Par, args: Seq[Par]) => (env: Env[Par]) =>
-        {
-          if (args.nonEmpty) {
-            interpreterErrorM[M].raiseError(
-              ReduceError("Error: hexToBytes does not take arguments"))
-          } else {
-            p.singleExpr() match {
-              case Some(Expr(GString(encoded))) =>
-                def decodingError(th: Throwable) =
-                  ReduceError(
-                    s"Error: exception was thrown when decoding input string to hexadecimal: ${th.getMessage}")
-                Try(Expr(GByteArray(ByteString.copyFrom(Base16.decode(encoded)))))
-                  .fold(th => interpreterErrorM[M].raiseError[Par](decodingError(th)),
-                        x => interpreterErrorM[M].pure[Par](x))
-              case _ =>
-                interpreterErrorM[M].raiseError(
-                  ReduceError("Error: hexToBytes can be called only on single strings."))
-            }
+    private[this] def hexToBytes: MethodType = { (p: Par, args: Seq[Par]) => (env: Env[Par]) =>
+      {
+        if (args.nonEmpty) {
+          s.raiseError(ReduceError("Error: hexToBytes does not take arguments"))
+        } else {
+          p.singleExpr() match {
+            case Some(Expr(GString(encoded))) =>
+              def decodingError(th: Throwable) =
+                ReduceError(
+                  s"Error: exception was thrown when decoding input string to hexadecimal: ${th.getMessage}")
+              Try(Expr(GByteArray(ByteString.copyFrom(Base16.decode(encoded)))))
+                .fold(th => s.raiseError[Par](decodingError(th)), x => s.pure[Par](x))
+            case _ =>
+              s.raiseError(ReduceError("Error: hexToBytes can be called only on single strings."))
           }
         }
+      }
     }
 
-    def methodTable(method: String): Option[(Par, Seq[Par]) => Env[Par] => M[Par]] =
+    private[this] def method(methodName: String, expectedArgsLength: Int, args: Seq[Par])(
+        thunk: => M[Par]): M[Par] =
+      if (args.length != expectedArgsLength) {
+        s.raiseError(ReduceError(s"Error: $methodName expects $expectedArgsLength Par argument(s)"))
+      } else {
+        thunk
+      }
+
+    private[this] def union: MethodType = { (p: Par, args: Seq[Par]) => (env: Env[Par]) =>
+      def locallyFreeUnion(base: Coeval[BitSet], other: Coeval[BitSet]): Coeval[BitSet] =
+        base.flatMap(b => other.map(o => b | o))
+      def union(baseExpr: Expr, otherExpr: Expr): M[Expr] =
+        (baseExpr.exprInstance, otherExpr.exprInstance) match {
+          case (ESetBody(base @ ParSet(basePs, _, _)), ESetBody(other @ ParSet(otherPs, _, _))) =>
+            Applicative[M].pure[Expr](
+              ESetBody(
+                ParSet(basePs.union(otherPs.sortedPars.toSet),
+                       base.connectiveUsed || other.connectiveUsed,
+                       locallyFreeUnion(base.locallyFree, other.locallyFree))))
+          case (EMapBody(base @ ParMap(baseMap, _, _)), EMapBody(other @ ParMap(otherMap, _, _))) =>
+            Applicative[M].pure[Expr](
+              EMapBody(
+                ParMap((baseMap ++ otherMap.sortedMap).toSeq,
+                       base.connectiveUsed || other.connectiveUsed,
+                       locallyFreeUnion(base.locallyFree, other.locallyFree))
+              )
+            )
+          case _ =>
+            s.raiseError(
+              ReduceError(
+                "Error: union applied to something that wasn't a set or a map"
+              ))
+
+        }
+
+      method("union", 1, args) {
+        for {
+          baseExpr  <- evalSingleExpr(p)(env)
+          otherExpr <- evalSingleExpr(args(0))(env)
+          result    <- union(baseExpr, otherExpr)
+        } yield result
+      }
+    }
+
+    private[this] def diff: MethodType = { (p: Par, args: Seq[Par]) => (env: Env[Par]) =>
+      def locallyFreeUnion(base: Coeval[BitSet], other: Coeval[BitSet]): Coeval[BitSet] =
+        base.flatMap(b => other.map(o => b | o))
+      def diff(baseExpr: Expr, otherExpr: Expr): M[Expr] =
+        (baseExpr.exprInstance, otherExpr.exprInstance) match {
+          case (ESetBody(base @ ParSet(basePs, _, _)), ESetBody(other @ ParSet(otherPs, _, _))) =>
+            Applicative[M].pure[Expr](
+              ESetBody(
+                ParSet(basePs.diff(otherPs.sortedPars.toSet),
+                       base.connectiveUsed || other.connectiveUsed,
+                       locallyFreeUnion(base.locallyFree, other.locallyFree))))
+          case (EMapBody(ParMap(basePs, _, _)), EMapBody(ParMap(otherPs, _, _))) =>
+            val newMap = basePs -- otherPs.keys
+            Applicative[M].pure[Expr](
+              EMapBody(ParMap(newMap))
+            )
+          case _ =>
+            s.raiseError(ReduceError("Error: diff applied to something that wasn't a Set"))
+        }
+      method("diff", 1, args) {
+        for {
+          baseExpr  <- evalSingleExpr(p)(env)
+          otherExpr <- evalSingleExpr(args(0))(env)
+          result    <- diff(baseExpr, otherExpr)
+        } yield result
+      }
+    }
+
+    private[this] def add: MethodType = { (p: Par, args: Seq[Par]) => (env: Env[Par]) =>
+      def add(baseExpr: Expr, par: Par): M[Expr] =
+        baseExpr.exprInstance match {
+          case ESetBody(base @ ParSet(basePs, _, _)) =>
+            Applicative[M].pure[Expr](
+              ESetBody(
+                ParSet(basePs + par,
+                       base.connectiveUsed || par.connectiveUsed,
+                       base.locallyFree.map(b => b | par.locallyFree))))
+
+          case _ =>
+            s.raiseError(ReduceError("Error: add can be called only with one Par as argument."))
+        }
+
+      method("add", 1, args) {
+        for {
+          baseExpr <- evalSingleExpr(p)(env)
+          element  <- evalExpr(args(0))(env)
+          result   <- add(baseExpr, element)
+        } yield result
+      }
+    }
+
+    private[this] def delete: MethodType = { (p: Par, args: Seq[Par]) => (env: Env[Par]) =>
+      def delete(baseExpr: Expr, par: Par): M[Expr] =
+        baseExpr.exprInstance match {
+          case ESetBody(base @ ParSet(basePs, _, _)) =>
+            Applicative[M].pure[Expr](
+              ESetBody(
+                ParSet(basePs - par,
+                       base.connectiveUsed || par.connectiveUsed,
+                       base.locallyFree.map(b => b | par.locallyFree))))
+          case EMapBody(base @ ParMap(basePs, _, _)) =>
+            Applicative[M].pure[Expr](
+              EMapBody(
+                ParMap(basePs - par,
+                       base.connectiveUsed || par.connectiveUsed,
+                       base.locallyFree.map(b => b | par.locallyFree))))
+          case _ =>
+            s.raiseError(ReduceError("Error: add can be called only on Map and Set."))
+        }
+
+      method("delete", 1, args) {
+        for {
+          baseExpr <- evalSingleExpr(p)(env)
+          element  <- evalExpr(args(0))(env)
+          result   <- delete(baseExpr, element)
+        } yield result
+      }
+    }
+
+    private[this] def contains: MethodType = { (p: Par, args: Seq[Par]) => (env: Env[Par]) =>
+      def contains(baseExpr: Expr, par: Par): M[Expr] =
+        baseExpr.exprInstance match {
+          case ESetBody(ParSet(basePs, _, _)) =>
+            Applicative[M].pure[Expr](GBool(basePs.contains(par)))
+          case EMapBody(ParMap(basePs, _, _)) =>
+            Applicative[M].pure[Expr](GBool(basePs.contains(par)))
+          case _ =>
+            s.raiseError(ReduceError("Error: add can be called only on Map and Set."))
+        }
+
+      method("contains", 1, args) {
+        for {
+          baseExpr <- evalSingleExpr(p)(env)
+          element  <- evalExpr(args(0))(env)
+          result   <- contains(baseExpr, element)
+        } yield result
+      }
+    }
+
+    private[this] def get: MethodType = { (p: Par, args: Seq[Par]) => (env: Env[Par]) =>
+      def get(baseExpr: Expr, key: Par): M[Par] =
+        baseExpr.exprInstance match {
+          case EMapBody(ParMap(basePs, _, _)) =>
+            Applicative[M].pure[Par](basePs.getOrElse(key, VectorPar()))
+          case _ =>
+            s.raiseError(ReduceError("Error: get can be called only on Maps as argument."))
+        }
+
+      method("get", 1, args) {
+        for {
+          baseExpr <- evalSingleExpr(p)(env)
+          key      <- evalExpr(args(0))(env)
+          result   <- get(baseExpr, key)
+        } yield result
+      }
+    }
+
+    def methodTable(method: String): Option[MethodType] =
       method match {
         case "nth"         => Some(nth)
         case "toByteArray" => Some(toByteArray)
         case "hexToBytes"  => Some(hexToBytes)
+        case "union"       => Some(union)
+        case "diff"        => Some(diff)
+        case "add"         => Some(add)
+        case "delete"      => Some(delete)
+        case "contains"    => Some(contains)
+        case "get"         => Some(get)
         case _             => None
       }
 
     def evalSingleExpr(p: Par)(implicit env: Env[Par]): M[Expr] =
-      if (!p.sends.isEmpty || !p.receives.isEmpty || !p.evals.isEmpty || !p.news.isEmpty || !p.matches.isEmpty || !p.ids.isEmpty)
-        interpreterErrorM[M].raiseError(
+      if (!p.sends.isEmpty || !p.receives.isEmpty || !p.news.isEmpty || !p.matches.isEmpty || !p.ids.isEmpty || !p.bundles.isEmpty)
+        s.raiseError(
           ReduceError("Error: parallel or non expression found where expression expected."))
       else
         p.exprs match {
           case (e: Expr) +: Nil => evalExprToExpr(e)
           case _ =>
-            interpreterErrorM[M].raiseError(ReduceError("Error: Multiple expressions given."))
+            s.raiseError(ReduceError("Error: Multiple expressions given."))
         }
 
     def evalToInt(p: Par)(implicit env: Env[Par]): M[Int] =
-      if (!p.sends.isEmpty || !p.receives.isEmpty || !p.evals.isEmpty || !p.news.isEmpty || !p.matches.isEmpty || !p.ids.isEmpty)
-        interpreterErrorM[M].raiseError(
+      if (!p.sends.isEmpty || !p.receives.isEmpty || !p.news.isEmpty || !p.matches.isEmpty || !p.ids.isEmpty || !p.bundles.isEmpty)
+        s.raiseError(
           ReduceError("Error: parallel or non expression found where expression expected."))
       else
         p.exprs match {
@@ -610,18 +870,17 @@ object Reduce {
               result <- evaled.exprInstance match {
                          case GInt(v) => Applicative[M].pure(v)
                          case _ =>
-                           interpreterErrorM[M].raiseError(
+                           s.raiseError(
                              ReduceError("Error: expression didn't evaluate to integer."))
                        }
             } yield result
           case _ =>
-            interpreterErrorM[M].raiseError(
-              ReduceError("Error: Integer expected, or unimplemented expression."))
+            s.raiseError(ReduceError("Error: Integer expected, or unimplemented expression."))
         }
 
     def evalToBool(p: Par)(implicit env: Env[Par]): M[Boolean] =
-      if (!p.sends.isEmpty || !p.receives.isEmpty || !p.evals.isEmpty || !p.news.isEmpty || !p.matches.isEmpty || !p.ids.isEmpty)
-        interpreterErrorM[M].raiseError(
+      if (!p.sends.isEmpty || !p.receives.isEmpty || !p.news.isEmpty || !p.matches.isEmpty || !p.ids.isEmpty || !p.bundles.isEmpty)
+        s.raiseError(
           ReduceError("Error: parallel or non expression found where expression expected."))
       else
         p.exprs match {
@@ -637,26 +896,31 @@ object Reduce {
               result <- evaled.exprInstance match {
                          case GBool(b) => Applicative[M].pure(b)
                          case _ =>
-                           interpreterErrorM[M].raiseError(
+                           s.raiseError(
                              ReduceError("Error: expression didn't evaluate to boolean."))
                        }
             } yield result
           case _ =>
-            interpreterErrorM[M].raiseError(ReduceError("Error: Multiple expressions given."))
+            s.raiseError(ReduceError("Error: Multiple expressions given."))
         }
 
     def updateLocallyFree(par: Par): Par = {
       val resultLocallyFree =
         par.sends.foldLeft(BitSet())((acc, send) => acc | send.locallyFree) |
           par.receives.foldLeft(BitSet())((acc, receive) => acc | receive.locallyFree) |
-          par.evals.foldLeft(BitSet())((acc, eval) => acc | EvalLocallyFree.locallyFree(eval)) |
           par.news.foldLeft(BitSet())((acc, newProc) => acc | newProc.locallyFree) |
           par.exprs.foldLeft(BitSet())((acc, expr) => acc | ExprLocallyFree.locallyFree(expr)) |
-          par.matches.foldLeft(BitSet())((acc, matchProc) => acc | matchProc.locallyFree)
+          par.matches.foldLeft(BitSet())((acc, matchProc) => acc | matchProc.locallyFree) |
+          par.bundles.foldLeft(BitSet())((acc, bundleProc) => acc | bundleProc.locallyFree)
       par.copy(locallyFree = resultLocallyFree)
     }
 
     def updateLocallyFree(elist: EList): EList = {
+      val resultLocallyFree = elist.ps.foldLeft(BitSet())((acc, p) => acc | p.locallyFree)
+      elist.copy(locallyFree = resultLocallyFree)
+    }
+
+    def updateLocallyFree(elist: ETuple): ETuple = {
       val resultLocallyFree = elist.ps.foldLeft(BitSet())((acc, p) => acc | p.locallyFree)
       elist.copy(locallyFree = resultLocallyFree)
     }

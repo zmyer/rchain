@@ -77,16 +77,28 @@ message NodeCoreMetrics {
   int64 peers = 7;
 }
 
+message RSpaceUsageMetric {
+  int64 count = 1;
+  double avgMilliseconds = 2;
+  int32 peakRate = 3;
+  int32 currentRate = 4;
+}
+
+message RSpaceUsage {
+  RSpaceUsageMetric consumes = 1;
+  RSpaceUsageMetric produces = 2;
+  RSpaceUsageMetric consumesComm = 3;
+  RSpaceUsageMetric producesComm = 4;
+  RSpaceUsageMetric installComm = 5;
+}
+
 message StoreUsage {
   int64 totalSizeOnDisk = 1;
   int64 rspaceSizeOnDisk = 2;
   int64 rspaceDataEntries = 3;
 
-  int64 rspaceConsumesCount = 4;
-  double rspaceConsumeAvgMilliseconds = 5;
-
-  int64 rspaceProducesCount = 6;
-  double rspaceProduceAvgMilliseconds = 7;
+  RSpaceUsage rspace = 4;
+  RSpaceUsage replayRSpace = 5;
 }
 
 service Diagnostics {

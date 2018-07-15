@@ -7,24 +7,19 @@ import cats.mtl.implicits._
 import com.google.protobuf.ByteString
 import coop.rchain.casper.Estimator.{BlockHash, Validator}
 import coop.rchain.casper.protocol._
-import coop.rchain.casper.util.rholang.Checkpoint
-import coop.rchain.casper.{BlockDag, BlockGenerator, Estimator, MultiParentCasper}
+import coop.rchain.casper.util.rholang.RuntimeManager
+import coop.rchain.casper._
+import coop.rchain.casper.helper.BlockGenerator
+import coop.rchain.casper.helper.BlockGenerator._
 import coop.rchain.catscontrib.Catscontrib
+import coop.rchain.p2p.EffectsTestInstances.LogStub
 import org.scalatest.{FlatSpec, Matchers}
 
 import scala.collection.immutable.{HashMap, HashSet}
 
 // See [[/docs/casper/images/no_finalizable_block_mistake_with_no_disagreement_check.png]]
 class BlocksResponseTest extends FlatSpec with Matchers with BlockGenerator {
-  type StateWithChain[A] = State[BlockDag, A]
-  val initState =
-    BlockDag(
-      HashMap.empty[Int, BlockMessage],
-      HashMap.empty[BlockHash, BlockMessage],
-      HashMap.empty[BlockHash, HashSet[BlockHash]],
-      HashMap.empty[Validator, BlockHash],
-      0
-    )
+  val initState = BlockDag()
 
   val v1     = ByteString.copyFromUtf8("Validator One")
   val v2     = ByteString.copyFromUtf8("Validator Two")
@@ -73,21 +68,26 @@ class BlocksResponseTest extends FlatSpec with Matchers with BlockGenerator {
              HashMap(v1 -> b6.blockHash, v2 -> b5.blockHash, v3 -> b4.blockHash))
     } yield b8
 
-  val chain: BlockDag = createChain.runS(initState).value
+  val chain: BlockDag = createChain.runS(initState)
   val genesis         = chain.idToBlocks(1)
 
   def testCasper[F[_]: Applicative]: MultiParentCasper[F] =
     new MultiParentCasper[F] {
-      def addBlock(b: BlockMessage): F[Unit]     = ().pure[F]
-      def contains(b: BlockMessage): F[Boolean]  = false.pure[F]
-      def deploy(r: Deploy): F[Unit]             = ().pure[F]
-      def estimator: F[IndexedSeq[BlockMessage]] = Estimator.tips(chain, genesis).pure[F]
-      def createBlock: F[Option[BlockMessage]]   = Applicative[F].pure[Option[BlockMessage]](None)
-      def blockDag: F[BlockDag]                  = chain.pure[F]
-      def tsCheckpoint(hash: ByteString): F[Option[Checkpoint]] =
-        Applicative[F].pure[Option[Checkpoint]](None)
+      def addBlock(b: BlockMessage): F[Unit]                             = ().pure[F]
+      def contains(b: BlockMessage): F[Boolean]                          = false.pure[F]
+      def deploy(r: Deploy): F[Unit]                                     = ().pure[F]
+      def estimator: F[IndexedSeq[BlockMessage]]                         = Estimator.tips(chain, genesis).pure[F]
+      def createBlock: F[Option[BlockMessage]]                           = Applicative[F].pure[Option[BlockMessage]](None)
+      def blockDag: F[BlockDag]                                          = chain.pure[F]
+      def normalizedInitialFault(weights: Map[Validator, Int]): F[Float] = 0f.pure[F]
+      def storageContents(hash: BlockHash): F[String]                    = "".pure[F]
     }
   implicit val casperEffect = testCasper[Id]
+  implicit val logEff       = new LogStub[Id]
+  implicit val constructorEffect =
+    MultiParentCasperConstructor
+      .successCasperConstructor[Id](ApprovedBlock.defaultInstance, casperEffect)
+  implicit val turanOracleEffect: SafetyOracle[Id] = SafetyOracle.turanOracle[Id]
 
   "getBlocksResponse" should "return only blocks in the main chain" in {
     val blocksResponse = BlockAPI.getBlocksResponse[Id]

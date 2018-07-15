@@ -22,7 +22,7 @@ import org.scalatest._
 import scala.collection.immutable.BitSet
 
 class VarMatcherSpec extends FlatSpec with Matchers {
-  import implicits._
+  import coop.rchain.models.rholang.implicits._
   import SpatialMatcher._
   val wc = Wildcard(Var.WildcardMsg())
   "Matching ground with var" should "work" in {
@@ -161,8 +161,8 @@ class VarMatcherSpec extends FlatSpec with Matchers {
   }
 
   "Matching an eval with no free variables" should "Succeed, but not capture anything." in {
-    val target: Eval   = Eval(ChanVar(BoundVar(0)))
-    val pattern: Eval  = Eval(ChanVar(BoundVar(0)))
+    val target: Expr   = EEvalBody(ChanVar(BoundVar(0)))
+    val pattern: Expr  = EEvalBody(ChanVar(BoundVar(0)))
     val expectedResult = Some(Map.empty[Int, Par])
     val result         = spatialMatch(target, pattern).runS(emptyMap)
     result should be(expectedResult)
@@ -229,6 +229,19 @@ class VarMatcherSpec extends FlatSpec with Matchers {
     val pattern: Expr  = EList(Seq(GInt(1)), remainder = Some(FreeVar(0)), connectiveUsed = true)
     val result         = spatialMatch(target, pattern).runS(emptyMap)
     val expectedResult = (Some(Map[Int, Par](0 -> EList(Seq(GInt(2))))))
+    result should be(expectedResult)
+    val targetPar: Par  = target
+    val patternPar: Par = pattern
+    val parResult       = spatialMatch(targetPar, patternPar).runS(emptyMap)
+    parResult should be(expectedResult)
+  }
+
+  "Matching a whole list with a remainder" should "capture the list." in {
+    // for (@[…a] <- @0) { … } | @0!([1,2,3])
+    val target: Expr   = EList(Seq(GInt(1), GInt(2), GInt(3)))
+    val pattern: Expr  = EList(remainder = Some(FreeVar(0)), connectiveUsed = true)
+    val result         = spatialMatch(target, pattern).runS(emptyMap)
+    val expectedResult = Some(Map[Int, Par](0 -> target))
     result should be(expectedResult)
     val targetPar: Par  = target
     val patternPar: Par = pattern
